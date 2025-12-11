@@ -1,10 +1,13 @@
-from openai import OpenAI
+from emergentintegrations.llm.chat import LlmChat, UserMessage
 from config import settings
 import logging
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
-
-client = OpenAI(api_key=settings.openai_api_key)
 
 async def generate_redirect_recommendation(error_url: str, site_url: str, existing_pages: list = None):
     """
@@ -30,20 +33,18 @@ REASON: [Brief explanation of why this is the best choice]
 """
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are an SEO expert specializing in 404 error recovery and redirect strategies."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=300
-        )
+        # Initialize LLM Chat with Emergent LLM key
+        chat = LlmChat(
+            api_key=os.getenv("EMERGENT_LLM_KEY"),
+            session_id=f"redirect-{error_url}",
+            system_message="You are an SEO expert specializing in 404 error recovery and redirect strategies."
+        ).with_model("openai", "gpt-4o-mini")
         
-        content = response.choices[0].message.content
+        user_message = UserMessage(text=prompt)
+        response = await chat.send_message(user_message)
         
         # Parse response
-        lines = content.strip().split("\n")
+        lines = response.strip().split("\n")
         redirect_target = None
         reason = None
         
@@ -84,18 +85,17 @@ Provide a brief, actionable content suggestion (2-3 sentences).
 """
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are an SEO content strategist helping create content to replace 404 pages."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=200
-        )
+        # Initialize LLM Chat with Emergent LLM key
+        chat = LlmChat(
+            api_key=os.getenv("EMERGENT_LLM_KEY"),
+            session_id=f"content-{error_url}",
+            system_message="You are an SEO content strategist helping create content to replace 404 pages."
+        ).with_model("openai", "gpt-4o-mini")
         
-        suggestion = response.choices[0].message.content.strip()
-        return suggestion
+        user_message = UserMessage(text=prompt)
+        response = await chat.send_message(user_message)
+        
+        return response.strip()
     
     except Exception as e:
         logger.error(f"Failed to generate content suggestion: {e}")
