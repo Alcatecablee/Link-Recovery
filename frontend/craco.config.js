@@ -34,6 +34,13 @@ const webpackConfig = {
     devServerConfig.allowedHosts = 'all';
     devServerConfig.host = '0.0.0.0';
     devServerConfig.port = 5000;
+    devServerConfig.proxy = [
+      {
+        context: ['/api'],
+        target: 'http://localhost:8000',
+        changeOrigin: true
+      }
+    ];
     return devServerConfig;
   },
   webpack: {

@@ -1,9 +1,7 @@
 import axios from 'axios';
 
-const API_BASE = process.env.REACT_APP_BACKEND_URL;
-
 const apiClient = axios.create({
-  baseURL: `${API_BASE}/api`,
+  baseURL: '/api',
   withCredentials: true,
   headers: {
     'Content-Type': 'application/json'

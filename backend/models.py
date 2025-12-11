@@ -1,72 +1,100 @@
+from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey
+from sqlalchemy.orm import relationship
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional
 from datetime import datetime
 import uuid
 
-class Site(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    user_id: str
-    site_url: str
-    site_type: str = "url-prefix"  # or 'domain'
-    permission_level: str
-    last_scan: Optional[datetime] = None
-    status: str = "active"  # active, paused, error
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+from database import Base
 
-class Error404(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    site_id: str
-    url: str
-    backlink_count: int = 0
-    priority_score: int = 0  # 0-100 based on backlinks and traffic
-    status: str = "new"  # new, fixed, ignored
-    detected_at: datetime = Field(default_factory=datetime.utcnow)
-    last_checked: datetime = Field(default_factory=datetime.utcnow)
-    impressions: int = 0
-    clicks: int = 0
+def generate_uuid():
+    return str(uuid.uuid4())
 
-class Backlink(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    error_id: str
-    source_url: str
-    anchor_text: Optional[str] = None
-    discovered_at: datetime = Field(default_factory=datetime.utcnow)
+class UserDB(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    email = Column(String, unique=True, nullable=False)
+    google_id = Column(String, nullable=True)
+    google_access_token = Column(Text, nullable=True)
+    google_refresh_token = Column(Text, nullable=True)
+    google_token_expiry = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    sites = relationship("SiteDB", back_populates="user")
 
-class Recommendation(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    error_id: str
-    redirect_target: Optional[str] = None
-    redirect_reason: Optional[str] = None
-    content_suggestion: Optional[str] = None
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+class SiteDB(Base):
+    __tablename__ = "sites"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.id"), nullable=False)
+    site_url = Column(String, nullable=False)
+    site_type = Column(String, default="url-prefix")
+    permission_level = Column(String, nullable=False)
+    last_scan = Column(DateTime, nullable=True)
+    status = Column(String, default="active")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    user = relationship("UserDB", back_populates="sites")
+    errors = relationship("Error404DB", back_populates="site")
+    scan_logs = relationship("ScanLogDB", back_populates="site")
 
-class ScanLog(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    site_id: str
-    scan_type: str  # manual, scheduled
-    status: str  # running, completed, failed
-    errors_found: int = 0
-    started_at: datetime = Field(default_factory=datetime.utcnow)
-    completed_at: Optional[datetime] = None
-    error_message: Optional[str] = None
+class Error404DB(Base):
+    __tablename__ = "errors_404"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    site_id = Column(String, ForeignKey("sites.id"), nullable=False)
+    url = Column(String, nullable=False)
+    backlink_count = Column(Integer, default=0)
+    priority_score = Column(Integer, default=0)
+    status = Column(String, default="new")
+    detected_at = Column(DateTime, default=datetime.utcnow)
+    last_checked = Column(DateTime, default=datetime.utcnow)
+    impressions = Column(Integer, default=0)
+    clicks = Column(Integer, default=0)
+    
+    site = relationship("SiteDB", back_populates="errors")
+    backlinks = relationship("BacklinkDB", back_populates="error")
+    recommendation = relationship("RecommendationDB", back_populates="error", uselist=False)
 
-class User(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    email: str
-    google_id: Optional[str] = None
-    google_access_token: Optional[str] = None
-    google_refresh_token: Optional[str] = None
-    google_token_expiry: Optional[datetime] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+class BacklinkDB(Base):
+    __tablename__ = "backlinks"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    error_id = Column(String, ForeignKey("errors_404.id"), nullable=False)
+    source_url = Column(String, nullable=False)
+    anchor_text = Column(String, nullable=True)
+    discovered_at = Column(DateTime, default=datetime.utcnow)
+    
+    error = relationship("Error404DB", back_populates="backlinks")
 
-# Request/Response models
+class RecommendationDB(Base):
+    __tablename__ = "recommendations"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    error_id = Column(String, ForeignKey("errors_404.id"), nullable=False, unique=True)
+    redirect_target = Column(String, nullable=True)
+    redirect_reason = Column(Text, nullable=True)
+    content_suggestion = Column(Text, nullable=True)
+    generated_at = Column(DateTime, default=datetime.utcnow)
+    
+    error = relationship("Error404DB", back_populates="recommendation")
+
+class ScanLogDB(Base):
+    __tablename__ = "scan_logs"
+    id = Column(String, primary_key=True, default=generate_uuid)
+    site_id = Column(String, ForeignKey("sites.id"), nullable=False)
+    scan_type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    errors_found = Column(Integer, default=0)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+    
+    site = relationship("SiteDB", back_populates="scan_logs")
+
 class SiteCreate(BaseModel):
     site_url: str
 
 class Error404Update(BaseModel):
-    status: str  # fixed, ignored
+    status: str
 
 class ScanTrigger(BaseModel):
     site_id: str

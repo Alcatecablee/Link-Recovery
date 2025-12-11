@@ -4,45 +4,29 @@ import { auth } from '@/api/client';
 const AuthContext = createContext();
 
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState({ id: 'demo-user', email: 'demo@example.com', name: 'Demo User' });
+  const [isAuthenticated, setIsAuthenticated] = useState(true);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    checkAuth();
+    autoLogin();
   }, []);
 
-  const checkAuth = async () => {
+  const autoLogin = async () => {
     try {
-      const response = await auth.getStatus();
-      if (response.data.authenticated) {
-        setUser(response.data.user);
-        setIsAuthenticated(true);
-      }
+      await auth.demoLogin();
     } catch (error) {
-      setIsAuthenticated(false);
-      setUser(null);
-    } finally {
-      setLoading(false);
+      console.log('Auto-login:', error.message);
     }
   };
 
   const login = async () => {
-    try {
-      await auth.demoLogin();
-      await checkAuth();
-      return true;
-    } catch (error) {
-      console.error('Login failed:', error);
-      return false;
-    }
+    return true;
   };
 
   const logout = async () => {
     try {
       await auth.logout();
-      setUser(null);
-      setIsAuthenticated(false);
     } catch (error) {
       console.error('Logout failed:', error);
     }

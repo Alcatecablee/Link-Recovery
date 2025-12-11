@@ -1,120 +1,73 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, update
+from sqlalchemy.orm import selectinload
 from contextlib import asynccontextmanager
 import os
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional
+import uuid
 
-# Import local modules
-from config import settings
+from database import get_db, init_db, engine, Base
 from models import (
-    Site, SiteCreate, Error404, Error404Update, Recommendation,
-    ScanLog, User, ScanTrigger
+    UserDB, SiteDB, Error404DB, BacklinkDB, RecommendationDB, ScanLogDB,
+    SiteCreate, Error404Update, ScanTrigger
 )
 from auth_handler import create_access_token, get_current_user
-from gsc_service import get_verified_sites, query_search_analytics
 from ai_service import generate_redirect_recommendation, generate_content_suggestion
-from scanner import scan_site_for_404s
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# MongoDB connection
-ROOT_DIR = Path(__file__).parent
-
-# Database manager
-class MongoDBManager:
-    client: AsyncIOMotorClient = None
-    database: AsyncIOMotorDatabase = None
-
-    async def connect(self):
-        self.client = AsyncIOMotorClient(settings.mongo_url)
-        self.database = self.client[settings.db_name]
-        await self.database.command("ping")
-        logger.info("Connected to MongoDB")
-
-    async def close(self):
-        if self.client:
-            self.client.close()
-            logger.info("Disconnected from MongoDB")
-
-    async def get_database(self) -> AsyncIOMotorDatabase:
-        return self.database
-
-db_manager = MongoDBManager()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db_manager.connect()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables created")
     yield
-    await db_manager.close()
 
-# Create FastAPI app
 app = FastAPI(lifespan=lifespan, title="404 Recovery & Backlink Retention Tool")
-
-# Create API router
 api_router = APIRouter(prefix="/api")
 
-# Dependency for database
-async def get_db() -> AsyncIOMotorDatabase:
-    return await db_manager.get_database()
-
-# ============ AUTH ROUTES ============
-
 @api_router.get("/auth/status")
-async def auth_status(request: Request, db: AsyncIOMotorDatabase = Depends(get_db)):
-    """Check if user is authenticated"""
+async def auth_status(request: Request, db: AsyncSession = Depends(get_db)):
     try:
         current_user = await get_current_user(request)
-        user_data = await db.users.find_one({"id": current_user["sub"]}, {"_id": 0})
+        result = await db.execute(select(UserDB).where(UserDB.id == current_user["sub"]))
+        user = result.scalar_one_or_none()
         
-        return {
-            "authenticated": True,
-            "user": {
-                "id": user_data["id"],
-                "email": user_data["email"]
+        if user:
+            return {
+                "authenticated": True,
+                "user": {"id": user.id, "email": user.email}
             }
-        }
+        return {"authenticated": False}
     except:
         return {"authenticated": False}
 
-@api_router.get("/auth/google")
-async def login_google():
-    """Initiate Google OAuth flow - For MVP, we'll use a simulated flow"""
-    # In production, implement full OAuth with Google
-    # For MVP testing without OAuth setup, return instruction
-    return {
-        "message": "For MVP: Please add GSC credentials manually",
-        "oauth_url": "/api/auth/google/callback"
-    }
-
 @api_router.post("/auth/demo-login")
-async def demo_login(db: AsyncIOMotorDatabase = Depends(get_db)):
-    """Create a demo user for MVP testing (no OAuth required)"""
-    demo_user = User(
-        email="demo@linkrecovery.com",
-        google_id="demo_user"
-    )
+async def demo_login(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(UserDB).where(UserDB.email == "demo@linkrecovery.com"))
+    user = result.scalar_one_or_none()
     
-    # Check if demo user exists
-    existing = await db.users.find_one({"email": demo_user.email}, {"_id": 0})
+    if not user:
+        user = UserDB(
+            id=str(uuid.uuid4()),
+            email="demo@linkrecovery.com",
+            google_id="demo_user"
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
     
-    if not existing:
-        await db.users.insert_one(demo_user.model_dump())
-        user_id = demo_user.id
-    else:
-        user_id = existing["id"]
-    
-    # Create JWT token
-    access_token = create_access_token({"sub": user_id, "email": demo_user.email})
+    access_token = create_access_token({"sub": user.id, "email": user.email})
     
     response = Response(content='{"message": "Logged in as demo user"}', media_type="application/json")
     response.set_cookie(
@@ -125,387 +78,271 @@ async def demo_login(db: AsyncIOMotorDatabase = Depends(get_db)):
         samesite="lax",
         max_age=30 * 60
     )
-    
     return response
 
 @api_router.post("/auth/logout")
 async def logout():
-    """Logout user"""
     response = Response(content='{"message": "Logged out"}', media_type="application/json")
     response.delete_cookie("access_token")
     return response
 
-# ============ SITES ROUTES ============
-
 @api_router.get("/sites")
-async def list_sites(
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """List all connected sites"""
+async def list_sites(request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
-    
-    sites = await db.sites.find(
-        {"user_id": current_user["sub"]},
-        {"_id": 0}
-    ).to_list(100)
-    
-    return {"sites": sites}
+    result = await db.execute(select(SiteDB).where(SiteDB.user_id == current_user["sub"]))
+    sites = result.scalars().all()
+    return {"sites": [{"id": s.id, "site_url": s.site_url, "status": s.status, "last_scan": s.last_scan} for s in sites]}
 
 @api_router.post("/sites")
-async def create_site(
-    site_data: SiteCreate,
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """Add a new site to monitor"""
+async def create_site(site_data: SiteCreate, request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    # Check if site already exists
-    existing = await db.sites.find_one(
-        {"user_id": current_user["sub"], "site_url": site_data.site_url},
-        {"_id": 0}
+    result = await db.execute(
+        select(SiteDB).where(SiteDB.user_id == current_user["sub"], SiteDB.site_url == site_data.site_url)
     )
-    
-    if existing:
+    if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Site already exists")
     
-    site = Site(
+    site = SiteDB(
+        id=str(uuid.uuid4()),
         user_id=current_user["sub"],
         site_url=site_data.site_url,
         permission_level="owner"
     )
+    db.add(site)
+    await db.commit()
+    await db.refresh(site)
     
-    await db.sites.insert_one(site.model_dump())
-    
-    return {"message": "Site added successfully", "site": site}
+    return {"message": "Site added successfully", "site": {"id": site.id, "site_url": site.site_url}}
 
 @api_router.post("/sites/{site_id}/scan")
-async def trigger_scan(
-    site_id: str,
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """Trigger a 404 scan for a site"""
+async def trigger_scan(site_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    # Get site
-    site = await db.sites.find_one(
-        {"id": site_id, "user_id": current_user["sub"]},
-        {"_id": 0}
+    result = await db.execute(
+        select(SiteDB).where(SiteDB.id == site_id, SiteDB.user_id == current_user["sub"])
     )
+    site = result.scalar_one_or_none()
     
     if not site:
         raise HTTPException(status_code=404, detail="Site not found")
     
-    # For MVP without OAuth, create sample 404 errors
-    # In production, this would call scan_site_for_404s
     sample_errors = [
-        Error404(
-            site_id=site_id,
-            url=f"{site['site_url']}/old-product-page",
-            backlink_count=5,
-            priority_score=75,
-            impressions=150,
-            clicks=0
-        ),
-        Error404(
-            site_id=site_id,
-            url=f"{site['site_url']}/deleted-blog-post",
-            backlink_count=12,
-            priority_score=90,
-            impressions=450,
-            clicks=0
-        ),
-        Error404(
-            site_id=site_id,
-            url=f"{site['site_url']}/missing-category",
-            backlink_count=3,
-            priority_score=60,
-            impressions=80,
-            clicks=0
-        )
+        {"url": f"{site.site_url}/old-product-page", "backlink_count": 5, "priority_score": 75, "impressions": 150},
+        {"url": f"{site.site_url}/deleted-blog-post", "backlink_count": 12, "priority_score": 90, "impressions": 450},
+        {"url": f"{site.site_url}/missing-category", "backlink_count": 3, "priority_score": 60, "impressions": 80},
     ]
     
-    # Insert sample errors
     errors_inserted = 0
-    for error in sample_errors:
-        existing = await db.errors_404.find_one(
-            {"site_id": site_id, "url": error.url},
-            {"_id": 0}
+    for err_data in sample_errors:
+        result = await db.execute(
+            select(Error404DB).where(Error404DB.site_id == site_id, Error404DB.url == err_data["url"])
         )
-        
-        if not existing:
-            await db.errors_404.insert_one(error.model_dump())
+        if not result.scalar_one_or_none():
+            error = Error404DB(
+                id=str(uuid.uuid4()),
+                site_id=site_id,
+                url=err_data["url"],
+                backlink_count=err_data["backlink_count"],
+                priority_score=err_data["priority_score"],
+                impressions=err_data["impressions"]
+            )
+            db.add(error)
             errors_inserted += 1
     
-    # Update site last_scan
-    await db.sites.update_one(
-        {"id": site_id},
-        {"$set": {"last_scan": datetime.utcnow()}}
-    )
+    site.last_scan = datetime.utcnow()
+    await db.commit()
     
-    return {
-        "message": "Scan completed",
-        "errors_found": errors_inserted
-    }
-
-# ============ 404 ERRORS ROUTES ============
+    return {"message": "Scan completed", "errors_found": errors_inserted}
 
 @api_router.get("/errors")
-async def list_errors(
-    request: Request,
-    site_id: Optional[str] = None,
-    status: Optional[str] = None,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """List all 404 errors with optional filters"""
+async def list_errors(request: Request, site_id: Optional[str] = None, status: Optional[str] = None, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    # Build query
-    query = {}
+    query = select(Error404DB).join(SiteDB).where(SiteDB.user_id == current_user["sub"])
     
     if site_id:
-        # Verify user owns the site
-        site = await db.sites.find_one(
-            {"id": site_id, "user_id": current_user["sub"]},
-            {"_id": 0}
-        )
-        if not site:
-            raise HTTPException(status_code=404, detail="Site not found")
-        query["site_id"] = site_id
-    else:
-        # Get all user's sites
-        user_sites = await db.sites.find(
-            {"user_id": current_user["sub"]},
-            {"_id": 0, "id": 1}
-        ).to_list(100)
-        site_ids = [s["id"] for s in user_sites]
-        query["site_id"] = {"$in": site_ids}
-    
+        query = query.where(Error404DB.site_id == site_id)
     if status:
-        query["status"] = status
+        query = query.where(Error404DB.status == status)
     
-    errors = await db.errors_404.find(query, {"_id": 0}).sort("priority_score", -1).to_list(1000)
+    query = query.order_by(Error404DB.priority_score.desc())
+    result = await db.execute(query)
+    errors = result.scalars().all()
     
-    return {"errors": errors, "count": len(errors)}
+    return {
+        "errors": [
+            {
+                "id": e.id, "site_id": e.site_id, "url": e.url,
+                "backlink_count": e.backlink_count, "priority_score": e.priority_score,
+                "status": e.status, "impressions": e.impressions, "clicks": e.clicks
+            } for e in errors
+        ],
+        "count": len(errors)
+    }
 
 @api_router.get("/errors/{error_id}")
-async def get_error_details(
-    error_id: str,
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """Get detailed information about a specific 404 error"""
+async def get_error_details(error_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    error = await db.errors_404.find_one({"id": error_id}, {"_id": 0})
+    result = await db.execute(
+        select(Error404DB).options(selectinload(Error404DB.backlinks), selectinload(Error404DB.recommendation))
+        .where(Error404DB.id == error_id)
+    )
+    error = result.scalar_one_or_none()
     
     if not error:
         raise HTTPException(status_code=404, detail="Error not found")
     
-    # Verify user owns the site
-    site = await db.sites.find_one(
-        {"id": error["site_id"], "user_id": current_user["sub"]},
-        {"_id": 0}
+    site_result = await db.execute(
+        select(SiteDB).where(SiteDB.id == error.site_id, SiteDB.user_id == current_user["sub"])
     )
+    site = site_result.scalar_one_or_none()
     
     if not site:
         raise HTTPException(status_code=404, detail="Unauthorized")
     
-    # Get backlinks
-    backlinks = await db.backlinks.find({"error_id": error_id}, {"_id": 0}).to_list(100)
-    
-    # Get recommendations
-    recommendation = await db.recommendations.find_one({"error_id": error_id}, {"_id": 0})
-    
     return {
-        "error": error,
-        "site": site,
-        "backlinks": backlinks,
-        "recommendation": recommendation
+        "error": {
+            "id": error.id, "site_id": error.site_id, "url": error.url,
+            "backlink_count": error.backlink_count, "priority_score": error.priority_score,
+            "status": error.status
+        },
+        "site": {"id": site.id, "site_url": site.site_url},
+        "backlinks": [{"id": b.id, "source_url": b.source_url, "anchor_text": b.anchor_text} for b in error.backlinks],
+        "recommendation": {
+            "redirect_target": error.recommendation.redirect_target,
+            "redirect_reason": error.recommendation.redirect_reason,
+            "content_suggestion": error.recommendation.content_suggestion
+        } if error.recommendation else None
     }
 
 @api_router.post("/errors/{error_id}/generate-recommendations")
-async def generate_recommendations(
-    error_id: str,
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """Generate AI-powered recommendations for a 404 error"""
+async def generate_recommendations(error_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    error = await db.errors_404.find_one({"id": error_id}, {"_id": 0})
+    result = await db.execute(select(Error404DB).where(Error404DB.id == error_id))
+    error = result.scalar_one_or_none()
     
     if not error:
         raise HTTPException(status_code=404, detail="Error not found")
     
-    # Verify user owns the site
-    site = await db.sites.find_one(
-        {"id": error["site_id"], "user_id": current_user["sub"]},
-        {"_id": 0}
+    site_result = await db.execute(
+        select(SiteDB).where(SiteDB.id == error.site_id, SiteDB.user_id == current_user["sub"])
     )
+    site = site_result.scalar_one_or_none()
     
     if not site:
         raise HTTPException(status_code=404, detail="Unauthorized")
     
-    # Get existing pages from the site
-    all_site_errors = await db.errors_404.find(
-        {"site_id": error["site_id"], "status": "fixed"},
-        {"_id": 0, "url": 1}
-    ).to_list(50)
+    redirect_rec = await generate_redirect_recommendation(error.url, site.site_url, [])
+    content_suggestion = await generate_content_suggestion(error.url, site.site_url, error.backlink_count)
     
-    existing_pages = [e["url"] for e in all_site_errors]
-    
-    # Generate redirect recommendation
-    redirect_rec = await generate_redirect_recommendation(
-        error["url"],
-        site["site_url"],
-        existing_pages
-    )
-    
-    # Generate content suggestion
-    content_suggestion = await generate_content_suggestion(
-        error["url"],
-        site["site_url"],
-        error.get("backlink_count", 0)
-    )
-    
-    # Check if recommendation already exists
-    existing_rec = await db.recommendations.find_one({"error_id": error_id}, {"_id": 0})
-    
-    recommendation = Recommendation(
-        error_id=error_id,
-        redirect_target=redirect_rec.get("redirect_target"),
-        redirect_reason=redirect_rec.get("reason"),
-        content_suggestion=content_suggestion
-    )
+    rec_result = await db.execute(select(RecommendationDB).where(RecommendationDB.error_id == error_id))
+    existing_rec = rec_result.scalar_one_or_none()
     
     if existing_rec:
-        # Update existing
-        await db.recommendations.update_one(
-            {"id": existing_rec["id"]},
-            {"$set": recommendation.model_dump()}
-        )
-        recommendation.id = existing_rec["id"]
+        existing_rec.redirect_target = redirect_rec.get("redirect_target")
+        existing_rec.redirect_reason = redirect_rec.get("reason")
+        existing_rec.content_suggestion = content_suggestion
+        existing_rec.generated_at = datetime.utcnow()
     else:
-        # Insert new
-        await db.recommendations.insert_one(recommendation.model_dump())
+        rec = RecommendationDB(
+            id=str(uuid.uuid4()),
+            error_id=error_id,
+            redirect_target=redirect_rec.get("redirect_target"),
+            redirect_reason=redirect_rec.get("reason"),
+            content_suggestion=content_suggestion
+        )
+        db.add(rec)
     
-    return {"recommendation": recommendation}
+    await db.commit()
+    
+    return {"recommendation": {
+        "redirect_target": redirect_rec.get("redirect_target"),
+        "redirect_reason": redirect_rec.get("reason"),
+        "content_suggestion": content_suggestion
+    }}
 
 @api_router.patch("/errors/{error_id}")
-async def update_error_status(
-    error_id: str,
-    update: Error404Update,
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """Update the status of a 404 error (mark as fixed or ignored)"""
+async def update_error_status(error_id: str, update_data: Error404Update, request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    error = await db.errors_404.find_one({"id": error_id}, {"_id": 0})
+    result = await db.execute(select(Error404DB).where(Error404DB.id == error_id))
+    error = result.scalar_one_or_none()
     
     if not error:
         raise HTTPException(status_code=404, detail="Error not found")
     
-    # Verify user owns the site
-    site = await db.sites.find_one(
-        {"id": error["site_id"], "user_id": current_user["sub"]},
-        {"_id": 0}
+    site_result = await db.execute(
+        select(SiteDB).where(SiteDB.id == error.site_id, SiteDB.user_id == current_user["sub"])
     )
-    
-    if not site:
+    if not site_result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Unauthorized")
     
-    # Update status
-    await db.errors_404.update_one(
-        {"id": error_id},
-        {"$set": {"status": update.status, "last_checked": datetime.utcnow()}}
-    )
+    error.status = update_data.status
+    error.last_checked = datetime.utcnow()
+    await db.commit()
     
-    return {"message": "Error status updated", "status": update.status}
-
-# ============ DASHBOARD ROUTES ============
+    return {"message": "Error status updated", "status": update_data.status}
 
 @api_router.get("/dashboard/stats")
-async def get_dashboard_stats(
-    request: Request,
-    db: AsyncIOMotorDatabase = Depends(get_db)
-):
-    """Get dashboard statistics"""
+async def get_dashboard_stats(request: Request, db: AsyncSession = Depends(get_db)):
     current_user = await get_current_user(request)
     
-    # Get user's sites
-    sites_count = await db.sites.count_documents({"user_id": current_user["sub"]})
+    sites_result = await db.execute(select(SiteDB).where(SiteDB.user_id == current_user["sub"]))
+    sites = sites_result.scalars().all()
+    site_ids = [s.id for s in sites]
     
-    # Get all site IDs
-    user_sites = await db.sites.find(
-        {"user_id": current_user["sub"]},
-        {"_id": 0, "id": 1}
-    ).to_list(100)
-    site_ids = [s["id"] for s in user_sites]
+    if not site_ids:
+        return {
+            "sites_count": 0, "total_errors": 0, "new_errors": 0,
+            "fixed_errors": 0, "backlinks_affected": 0, "recent_scans": []
+        }
     
-    # Get error counts
-    total_errors = await db.errors_404.count_documents({"site_id": {"$in": site_ids}})
-    new_errors = await db.errors_404.count_documents({
-        "site_id": {"$in": site_ids},
-        "status": "new"
-    })
-    fixed_errors = await db.errors_404.count_documents({
-        "site_id": {"$in": site_ids},
-        "status": "fixed"
-    })
+    total_result = await db.execute(
+        select(func.count(Error404DB.id)).where(Error404DB.site_id.in_(site_ids))
+    )
+    total_errors = total_result.scalar() or 0
     
-    # Get total backlinks affected
-    total_backlinks = await db.errors_404.aggregate([
-        {"$match": {"site_id": {"$in": site_ids}}},
-        {"$group": {"_id": None, "total": {"$sum": "$backlink_count"}}}
-    ]).to_list(1)
+    new_result = await db.execute(
+        select(func.count(Error404DB.id)).where(Error404DB.site_id.in_(site_ids), Error404DB.status == "new")
+    )
+    new_errors = new_result.scalar() or 0
     
-    backlinks_affected = total_backlinks[0]["total"] if total_backlinks else 0
+    fixed_result = await db.execute(
+        select(func.count(Error404DB.id)).where(Error404DB.site_id.in_(site_ids), Error404DB.status == "fixed")
+    )
+    fixed_errors = fixed_result.scalar() or 0
     
-    # Get recent scans
-    recent_scans = await db.scan_logs.find(
-        {"site_id": {"$in": site_ids}},
-        {"_id": 0}
-    ).sort("started_at", -1).limit(5).to_list(5)
+    backlinks_result = await db.execute(
+        select(func.sum(Error404DB.backlink_count)).where(Error404DB.site_id.in_(site_ids))
+    )
+    backlinks_affected = backlinks_result.scalar() or 0
     
     return {
-        "sites_count": sites_count,
+        "sites_count": len(sites),
         "total_errors": total_errors,
         "new_errors": new_errors,
         "fixed_errors": fixed_errors,
         "backlinks_affected": backlinks_affected,
-        "recent_scans": recent_scans
+        "recent_scans": []
     }
 
-# Root route
 @api_router.get("/")
 async def root():
-    return {
-        "message": "404 Recovery & Backlink Retention API",
-        "version": "1.0.0",
-        "status": "running"
-    }
+    return {"message": "404 Recovery & Backlink Retention API", "version": "1.0.0", "status": "running"}
 
-# Include router
 app.include_router(api_router)
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=settings.cors_origins.split(','),
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown():
-    logger.info("Shutting down application...")
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
