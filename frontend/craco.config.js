@@ -30,6 +30,12 @@ if (config.enableHealthCheck) {
 }
 
 const webpackConfig = {
+  devServer: (devServerConfig) => {
+    devServerConfig.allowedHosts = 'all';
+    devServerConfig.host = '0.0.0.0';
+    devServerConfig.port = 5000;
+    return devServerConfig;
+  },
   webpack: {
     alias: {
       '@': path.resolve(__dirname, 'src'),
@@ -82,7 +88,10 @@ if (config.enableVisualEdits) {
 
 // Setup dev server with visual edits and/or health check
 if (config.enableVisualEdits || config.enableHealthCheck) {
+  const baseDevServer = webpackConfig.devServer;
   webpackConfig.devServer = (devServerConfig) => {
+    devServerConfig = baseDevServer(devServerConfig);
+    
     // Apply visual edits dev server setup if enabled
     if (config.enableVisualEdits && setupDevServer) {
       devServerConfig = setupDevServer(devServerConfig);

@@ -1,0 +1,13 @@
+modules = ["nodejs-20", "web", "python-3.11"]
+[agent]
+expertMode = true
+
+[nix]
+channel = "stable-25_05"
+packages = ["cargo", "libiconv", "libxcrypt", "rustc"]
+
+[userenv]
+
+[userenv.shared]
+REACT_APP_BACKEND_URL = "https://6805ad4d-f4e6-4e6f-9237-5e79d34f63cb-00-2u0re1odtx9ii.picard.replit.dev"
+PORT = "5000"

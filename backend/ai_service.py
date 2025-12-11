@@ -1,10 +1,9 @@
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 from config import settings
 import logging
 import os
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -33,18 +32,19 @@ REASON: [Brief explanation of why this is the best choice]
 """
 
     try:
-        # Initialize LLM Chat with Emergent LLM key
-        chat = LlmChat(
-            api_key=os.getenv("EMERGENT_LLM_KEY"),
-            session_id=f"redirect-{error_url}",
-            system_message="You are an SEO expert specializing in 404 error recovery and redirect strategies."
-        ).with_model("openai", "gpt-4o-mini")
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
-        user_message = UserMessage(text=prompt)
-        response = await chat.send_message(user_message)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an SEO expert specializing in 404 error recovery and redirect strategies."},
+                {"role": "user", "content": prompt}
+            ]
+        )
         
-        # Parse response
-        lines = response.strip().split("\n")
+        response_text = response.choices[0].message.content
+        
+        lines = response_text.strip().split("\n")
         redirect_target = None
         reason = None
         
@@ -85,17 +85,17 @@ Provide a brief, actionable content suggestion (2-3 sentences).
 """
 
     try:
-        # Initialize LLM Chat with Emergent LLM key
-        chat = LlmChat(
-            api_key=os.getenv("EMERGENT_LLM_KEY"),
-            session_id=f"content-{error_url}",
-            system_message="You are an SEO content strategist helping create content to replace 404 pages."
-        ).with_model("openai", "gpt-4o-mini")
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         
-        user_message = UserMessage(text=prompt)
-        response = await chat.send_message(user_message)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an SEO content strategist helping create content to replace 404 pages."},
+                {"role": "user", "content": prompt}
+            ]
+        )
         
-        return response.strip()
+        return response.choices[0].message.content.strip()
     
     except Exception as e:
         logger.error(f"Failed to generate content suggestion: {e}")
