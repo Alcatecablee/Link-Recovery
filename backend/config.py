@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     
-    # OpenAI for AI recommendations
-    openai_api_key: str = ""
+    # Emergent LLM key for AI recommendations
+    emergent_llm_key: str = ""
     
     # CORS
     cors_origins: str = "*"
